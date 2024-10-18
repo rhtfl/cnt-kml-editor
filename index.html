@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Редактор KML</title>
+    <meta charset="utf-8" />
+    <!-- Стили -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-draw/dist/leaflet.draw.css" />
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <h1>Редактор KML</h1>
+    <div id="container">
+        <div id="sidebar">
+            <h2>Слои</h2>
+            <button id="add-layer-btn">Добавить новый слой</button>
+            <ul id="layer-list"></ul>
+            <hr>
+            <input type="file" id="file-input" accept=".kml" />
+            <button id="save-btn">Сохранить KML</button>
+            <button id="union-btn">Объединить объекты</button>
+            <button id="difference-btn">Вырезать объекты</button>
+            <button id="delete-object-btn">Удалить объект</button>
+        </div>
+        <div id="map"></div>
+    </div>
+
+    <!-- Скрипты -->
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-draw/dist/leaflet.draw.js"></script>
+    <!-- Подключение JSTS -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsts/1.6.2/jsts.min.js"></script>
+    <script src="https://unpkg.com/togeojson"></script>
+    <script src="https://unpkg.com/tokml/tokml.js"></script>
+    <!-- Ваш скрипт -->
+    <script src="app.js"></script>
+</body>
+</html>
