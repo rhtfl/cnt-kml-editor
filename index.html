@@ -1,38 +1,191 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
-    <title>Редактор KML</title>
     <meta charset="utf-8" />
-    <!-- Стили -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
-    <link rel="stylesheet" href="https://unpkg.com/leaflet-draw/dist/leaflet.draw.css" />
-    <link rel="stylesheet" href="style.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>KML Editor — редактор слоёв и геометрии</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-    <h1>Редактор KML</h1>
-    <div id="container">
-        <div id="sidebar">
-            <h2>Слои</h2>
-            <button id="add-layer-btn">Добавить новый слой</button>
-            <ul id="layer-list"></ul>
-            <hr>
-            <input type="file" id="file-input" accept=".kml" />
-            <button id="save-btn">Сохранить KML</button>
-            <button id="union-btn">Объединить объекты</button>
-            <button id="difference-btn">Вырезать объекты</button>
-            <button id="delete-object-btn">Удалить объект</button>
+    <div class="app">
+        <header class="app-header" role="banner">
+            <div class="app-header__top">
+                <div class="app-header__start">
+                    <button type="button" class="icon-btn app-header__sidebar-toggle" id="sidebar-toggle" title="Свернуть панель слоёв" aria-expanded="true" aria-controls="sidebar">
+                        <span class="icon-btn__glyph">◀</span>
+                    </button>
+                    <div class="app-header__brand">
+                        <span class="app-header__title">KML Editor</span>
+                    </div>
+                    <div class="app-header__modes" role="tablist" aria-label="Режим приложения">
+                        <button type="button" class="btn btn--mode is-active" id="mode-tab-editor" role="tab" aria-selected="true" aria-controls="view-editor" data-app-mode="editor">Редактор</button>
+                        <button type="button" class="btn btn--mode" id="mode-tab-compare" role="tab" aria-selected="false" aria-controls="view-compare" data-app-mode="compare">Сравнение KML</button>
+                    </div>
+                </div>
+                <p class="selection-badge selection-badge--header" id="selection-info">Выбрано: 0</p>
+            </div>
+            <div class="app-header__ops" aria-label="Операции с геометрией">
+                <span class="app-header__ops-label">Операции</span>
+                <div class="app-header__btn-row">
+                    <button type="button" class="btn btn--op btn--header" id="union-btn" title="Минимум 2 полигона">Объединить (∪)</button>
+                    <button type="button" class="btn btn--op btn--header" id="intersect-btn" title="Ровно 2 полигона">Пересечение (∩)</button>
+                    <button type="button" class="btn btn--op btn--header" id="difference-btn" title="Первый минус второй">Вырезать (−)</button>
+                    <button type="button" class="btn btn--op btn--header" id="symdiff-btn" title="Ровно 2 полигона">Симм. разность (△)</button>
+                    <button type="button" class="btn btn--op btn--header" id="explode-btn" title="Multi* → отдельные объекты">Разбить мультигеометрию</button>
+                    <button type="button" class="btn btn--danger btn--header" id="delete-object-btn">Удалить выбранное</button>
+                </div>
+            </div>
+            <p class="hint hint--compact app-header__hint">∪ ∩ − △ — для полигонов. Линии и точки: импорт, рисование, экспорт.</p>
+        </header>
+
+        <div class="app-main-stage" id="app-main-stage">
+        <div id="view-editor" class="view-editor" aria-hidden="false">
+        <div class="app-body">
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar__body">
+                    <div class="sidebar__scroll">
+                        <h2 class="sidebar__section-title">Слои и файлы</h2>
+
+                        <p class="subsection-title">Слои</p>
+                        <div class="panel__toolbar">
+                            <button type="button" class="btn btn--primary" id="add-layer-btn">Новый слой</button>
+                        </div>
+                        <ul class="layer-list" id="layer-list"></ul>
+
+                        <div class="divider divider--loose"></div>
+
+                        <p class="subsection-title">Импорт KML (любой слой)</p>
+                        <label class="field">
+                            <span class="field__label">Целевой слой в списке</span>
+                            <select class="select" id="import-target-layer" name="import-target-layer"></select>
+                        </label>
+                        <label class="file-drop">
+                            <input type="file" id="file-input" name="kml-files" accept=".kml,application/vnd.google-earth.kml+xml,text/xml" multiple />
+                            <span class="file-drop__text">Перетащите KML сюда или нажмите для выбора</span>
+                            <span class="file-drop__meta">У пустого слоя такая же зона прямо в карточке слоя — удобно для нового слоя</span>
+                        </label>
+
+                        <div class="divider divider--loose"></div>
+
+                        <p class="subsection-title">Экспорт</p>
+                        <div class="btn-row">
+                            <button type="button" class="btn btn--secondary" id="export-all-btn" title="Все объекты в один KML">Весь проект</button>
+                            <button type="button" class="btn btn--secondary" id="export-selected-btn" title="Только выделенные объекты">Выделенное</button>
+                        </div>
+                        <div class="btn-row">
+                            <button type="button" class="btn btn--ghost" id="export-by-layer-btn">По слоям (несколько файлов)</button>
+                        </div>
+
+                        <p class="hint">Карта и список объектов: обычный клик — одно выделение; Shift, Ctrl или ⌘ + клик — добавить или убрать объект (в т.ч. из другого слоя для ∪∩−). Повторный клик по единственному выделенному — снять выбор. Порядок выбора важен для «Вырезать». Двойной клик по имени — переименовать. Ручка ⋮⋮ — перенос в другой слой.</p>
+                    </div>
+                </div>
+
+                <footer class="sidebar__foot">
+                    <span class="mono" id="coords-hint">Карта · Яндекс</span>
+                </footer>
+            </aside>
+
+            <main class="map-wrap">
+                <div id="map" class="map" role="application" aria-label="Карта"></div>
+                <div class="map-draw-toolbar" id="map-draw-toolbar" aria-label="Рисование на карте">
+                    <span class="map-draw-toolbar__label">Рисование</span>
+                    <button type="button" class="btn btn--ghost btn--draw is-active" data-draw-mode="select" title="Выбор объектов кликом">Выбор</button>
+                    <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="point" title="Одна точка">Точка</button>
+                    <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="polyline" title="Линия по кликам, затем Завершить">Линия</button>
+                    <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="polygon" title="Полигон по кликам, затем Завершить">Полигон</button>
+                    <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="rect" title="Два клика — углы прямоугольника">Прямоуг.</button>
+                    <button type="button" class="btn btn--primary btn--draw" id="draw-complete" hidden>Завершить</button>
+                    <button type="button" class="btn btn--ghost btn--draw" id="draw-cancel" hidden>Отмена</button>
+                </div>
+                <div class="map-overlay" id="draw-hint">
+                    <span>Режим «Выбор»: обычный клик по объекту на карте — одно выделение (редактор вершин только у одного полигона/линии). Shift, Ctrl или ⌘ + клик — добавить к выбору (∪∩−, в том числе объекты из разных слоёв). Белые круги — вершины, голубые ромбы — новая вершина на ребре. Рисование — панель сверху.</span>
+                </div>
+            </main>
         </div>
-        <div id="map"></div>
+        </div>
+
+        <div id="view-compare" class="view-compare" hidden role="tabpanel" aria-labelledby="mode-tab-compare" aria-hidden="true">
+            <div class="compare-toolbar">
+                <span class="compare-toolbar__title">Два KML на одной карте · двигайте полоску</span>
+                <label class="compare-file-btn btn btn--secondary">
+                    <span>KML слева</span>
+                    <input type="file" id="compare-file-a" name="compare-kml-a" accept=".kml,application/vnd.google-earth.kml+xml,text/xml" />
+                </label>
+                <label class="compare-file-btn btn btn--secondary">
+                    <span>KML справа</span>
+                    <input type="file" id="compare-file-b" name="compare-kml-b" accept=".kml,application/vnd.google-earth.kml+xml,text/xml" />
+                </label>
+                <button type="button" class="btn btn--primary" id="compare-fit-btn">Подогнать вид</button>
+                <button type="button" class="btn btn--ghost" id="compare-clear-a">Очистить слева</button>
+                <button type="button" class="btn btn--ghost" id="compare-clear-b">Очистить справа</button>
+            </div>
+            <div class="compare-stack" id="compare-stack" style="--compare-split: 50%;">
+                <div class="compare-layer compare-layer--a" aria-hidden="false">
+                    <div id="compare-map-a" class="compare-map-root" role="application" aria-label="Карта, KML слева"></div>
+                </div>
+                <div class="compare-layer compare-layer--b" aria-hidden="false">
+                    <div id="compare-map-b" class="compare-map-root" role="application" aria-label="Карта, KML справа"></div>
+                </div>
+                <div class="compare-splitter" id="compare-splitter" role="separator" aria-orientation="vertical" aria-valuemin="6" aria-valuemax="94" aria-valuenow="50" tabindex="0" title="Перетащите влево-вправо"></div>
+                <div class="compare-legend compare-legend--a">Слева</div>
+                <div class="compare-legend compare-legend--b">Справа</div>
+            </div>
+        </div>
+        </div>
     </div>
 
-    <!-- Скрипты -->
-    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
-    <script src="https://unpkg.com/leaflet-draw/dist/leaflet.draw.js"></script>
-    <!-- Подключение JSTS -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsts/1.6.2/jsts.min.js"></script>
+    <div class="modal" id="modal" hidden aria-modal="true" role="dialog">
+        <div class="modal__backdrop" data-close-modal></div>
+        <div class="modal__box">
+            <h2 class="modal__title" id="modal-title">Диалог</h2>
+            <div class="modal__body" id="modal-body"></div>
+            <div class="modal__actions" id="modal-actions"></div>
+        </div>
+    </div>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+    <script src="config.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsts/1.6.2/jsts.min.js" crossorigin=""></script>
     <script src="https://unpkg.com/togeojson"></script>
     <script src="https://unpkg.com/tokml/tokml.js"></script>
-    <!-- Ваш скрипт -->
-    <script src="app.js"></script>
+    <script>
+        (function () {
+            function loadApp() {
+                var s = document.createElement("script");
+                s.src = "app.js";
+                document.body.appendChild(s);
+            }
+            var k = window.YANDEX_MAPS_API_KEY;
+            var keyOk =
+                k &&
+                String(k).trim().length > 0 &&
+                String(k).indexOf("ВАШ_") !== 0 &&
+                String(k).indexOf("YOUR_") !== 0;
+            if (!keyOk) {
+                loadApp();
+                return;
+            }
+            var y = document.createElement("script");
+            y.src =
+                "https://api-maps.yandex.ru/v3/?apikey=" +
+                encodeURIComponent(k) +
+                "&lang=ru_RU";
+            y.async = true;
+            y.onload = loadApp;
+            y.onerror = function () {
+                var mapEl = document.getElementById("map");
+                if (mapEl) {
+                    mapEl.innerHTML =
+                        '<div class="map-error"><p>Не удалось загрузить JavaScript API Яндекс.Карт (проверьте ключ и сеть).</p></div>';
+                }
+                loadApp();
+            };
+            document.head.appendChild(y);
+        })();
+    </script>
 </body>
 </html>
