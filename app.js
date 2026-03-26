@@ -1949,6 +1949,64 @@
         return ga.difference(gb).union(gb.difference(ga));
     }
 
+    function geoJsonGeometryToJsts(geom) {
+        var f = {
+            type: "Feature",
+            properties: {},
+            geometry: JSON.parse(JSON.stringify(geom))
+        };
+        invertCoordinates(f);
+        return jstsReader.read(f.geometry);
+    }
+
+    /** Разбить геометрию на список Polygon (MultiPolygon → части, из GeometryCollection — только полигоны). */
+    function explodeToPolygons(geom) {
+        var out = [];
+        if (!geom) return out;
+        if (geom.type === "Polygon") {
+            out.push(geom);
+            return out;
+        }
+        if (geom.type === "MultiPolygon") {
+            geom.coordinates.forEach(function (ring) {
+                out.push({ type: "Polygon", coordinates: ring });
+            });
+            return out;
+        }
+        if (geom.type === "GeometryCollection" && geom.geometries) {
+            geom.geometries.forEach(function (g) {
+                out = out.concat(explodeToPolygons(g));
+            });
+        }
+        return out;
+    }
+
+    function featureLabelForOverlap(feat, index) {
+        var p = feat.properties || {};
+        var n = p.name;
+        if (n == null) n = p.Name;
+        if (n == null) n = p.title;
+        if (n != null && String(n).trim()) return String(n).trim();
+        return "Объект " + (index + 1);
+    }
+
+    function polygonGeometriesFromJstsIntersection(interJsts) {
+        var feat = jstsGeomToFeature(interJsts);
+        return explodeToPolygons(feat.geometry);
+    }
+
+    /**
+     * Наложение = есть общая 2D-область с ненулевой площадью.
+     * Касание только по ребру или вершине (пересечение — линия/точка) не считается.
+     */
+    function jstsIntersectionHasPositiveOverlapArea(interJsts, minArea) {
+        minArea = minArea == null ? 1e-16 : minArea;
+        if (!interJsts || interJsts.isEmpty()) return false;
+        if (typeof interJsts.getDimension !== "function" || interJsts.getDimension() < 2) return false;
+        if (typeof interJsts.getArea !== "function") return false;
+        return interJsts.getArea() > minArea;
+    }
+
     function addResultFeature(feature, targetLayerId) {
         importGeoJSONToLayer(feature, targetLayerId);
         fitMapToEntries(allEntries);
@@ -2080,6 +2138,27 @@
         });
     }
 
+    /** Дождаться размеров контейнера после снятия display:none — иначе YMap инициализируется с нулём и ничего не рисуется. */
+    function waitForNonZeroSize(el, maxFrames) {
+        maxFrames = maxFrames == null ? 48 : maxFrames;
+        return new Promise(function (resolve) {
+            var frame = 0;
+            function tick() {
+                if (!el || (el.clientWidth >= 2 && el.clientHeight >= 2)) {
+                    resolve();
+                    return;
+                }
+                frame++;
+                if (frame >= maxFrames) {
+                    resolve();
+                    return;
+                }
+                requestAnimationFrame(tick);
+            }
+            tick();
+        });
+    }
+
     async function ensureCompareMaps() {
         if (compareMapsReady) return;
         if (typeof ymaps3 === "undefined") {
@@ -2095,6 +2174,8 @@
         if (!elA || !elB) {
             throw new Error("Нет контейнеров сравнения.");
         }
+        var stack = document.getElementById("compare-stack");
+        await waitForNonZeroSize(stack || elA);
         var loc = { center: [37.618423, 55.751244], zoom: 5 };
         compareMapA = new YMap(
             elA,
@@ -2219,40 +2300,432 @@
         fr.readAsText(file);
     }
 
-    function setAppMode(compare) {
+    var overlapMap = null;
+    var overlapFeaturesBase = [];
+    var overlapFeaturesHits = [];
+    var overlapMapReady = false;
+    var overlapLastHitCollection = null;
+    var OVERLAP_BASE_HEX = "#3d8bfd";
+    var OVERLAP_HIT_HEX = "#f14b5c";
+    /** Порог площади пересечения (кв. градусов), ниже — шум / касание на численной сетке. */
+    var OVERLAP_MIN_AREA_SQ_DEG = 1e-16;
+
+    function overlapStyleSources(geomType) {
+        return hexToYmapStyle(OVERLAP_BASE_HEX, geomType, false);
+    }
+
+    function overlapStyleHits(geomType) {
+        var st = hexToYmapStyle(OVERLAP_HIT_HEX, geomType, false);
+        if (st.stroke && st.stroke[0]) {
+            st.stroke[0].width = Math.max(3, st.stroke[0].width || 2);
+        }
+        return st;
+    }
+
+    function overlapStyleHitsFocused(geomType) {
+        var t = geomType === "MultiPolygon" ? "Polygon" : geomType;
+        if (t === "Point" || t === "MultiPoint") {
+            return hexToYmapStyle("#ffd60a", geomType, true);
+        }
+        return {
+            stroke: [{ color: "#ffea00dd", width: 5 }],
+            fill: "#ffd60a66"
+        };
+    }
+
+    function resetOverlapHitStyles() {
+        overlapFeaturesHits.forEach(function (yf) {
+            if (!yf || !yf.update) return;
+            var g = yf.geometry;
+            var t = g && g.type ? g.type : "Polygon";
+            try {
+                yf.update({ style: overlapStyleHits(t === "MultiPolygon" ? "Polygon" : t) });
+            } catch (e) {
+                /* ignore */
+            }
+        });
+    }
+
+    function expandOverlapBBoxForFocus(b, margin) {
+        margin = margin == null ? 0.14 : margin;
+        var lngSpan = b.maxLng - b.minLng;
+        var latSpan = b.maxLat - b.minLat;
+        var padLng = lngSpan > 1e-9 ? lngSpan * margin : 0.0012;
+        var padLat = latSpan > 1e-9 ? latSpan * margin : 0.0012;
+        return {
+            minLng: b.minLng - padLng,
+            maxLng: b.maxLng + padLng,
+            minLat: b.minLat - padLat,
+            maxLat: b.maxLat + padLat
+        };
+    }
+
+    function focusOverlapHitByIndex(i) {
+        if (i < 0 || i >= overlapFeaturesHits.length || !overlapLastHitCollection) return;
+        resetOverlapHitStyles();
+        var yf = overlapFeaturesHits[i];
+        var gj = overlapLastHitCollection[i];
+        if (yf && yf.update) {
+            var gt = yf.geometry && yf.geometry.type ? yf.geometry.type : "Polygon";
+            try {
+                yf.update({ style: overlapStyleHitsFocused(gt) });
+            } catch (e) {
+                /* ignore */
+            }
+        }
+        if (gj && gj.geometry) {
+            var bb = bboxFromGeometry(gj.geometry);
+            if (bb) fitOverlapMapToBBox(expandOverlapBBoxForFocus(bb));
+        }
+        var list = document.getElementById("overlap-hit-list");
+        if (list) {
+            list.querySelectorAll(".overlap-hit-item").forEach(function (btn) {
+                var idx = parseInt(btn.getAttribute("data-hit-index"), 10);
+                btn.classList.toggle("is-active", idx === i);
+            });
+        }
+        setTimeout(function () {
+            window.dispatchEvent(new Event("resize"));
+        }, 50);
+    }
+
+    function rebuildOverlapHitList(featuresGeo) {
+        var ul = document.getElementById("overlap-hit-list");
+        var empty = document.getElementById("overlap-list-empty");
+        if (!ul) return;
+        ul.innerHTML = "";
+        if (!featuresGeo || featuresGeo.length === 0) {
+            if (empty) empty.hidden = false;
+            return;
+        }
+        if (empty) empty.hidden = true;
+        featuresGeo.forEach(function (feat, idx) {
+            var name =
+                feat.properties && feat.properties.name
+                    ? feat.properties.name
+                    : "Пересечение " + (idx + 1);
+            var li = document.createElement("li");
+            var btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "overlap-hit-item";
+            btn.setAttribute("data-hit-index", String(idx));
+            btn.setAttribute("role", "option");
+            btn.textContent = name;
+            li.appendChild(btn);
+            ul.appendChild(li);
+        });
+    }
+
+    function initOverlapHitListOnce() {
+        var ul = document.getElementById("overlap-hit-list");
+        if (!ul || ul.getAttribute("data-bound") === "1") return;
+        ul.setAttribute("data-bound", "1");
+        ul.addEventListener("click", function (ev) {
+            var btn = ev.target.closest(".overlap-hit-item");
+            if (!btn || !ul.contains(btn)) return;
+            var idx = parseInt(btn.getAttribute("data-hit-index"), 10);
+            if (!isNaN(idx)) focusOverlapHitByIndex(idx);
+        });
+    }
+
+    function overlapStyleHidden() {
+        return {
+            stroke: [{ color: "rgba(0,0,0,0)", width: 0 }],
+            fill: "rgba(0,0,0,0)"
+        };
+    }
+
+    function refreshOverlapSourceVisibility() {
+        var cb = document.getElementById("overlap-show-sources");
+        var show = !cb || cb.checked;
+        var hiddenSt = overlapStyleHidden();
+        overlapFeaturesBase.forEach(function (yf) {
+            if (!yf || !yf.update) return;
+            var g = yf.geometry;
+            var t = g ? g.type : "Polygon";
+            try {
+                yf.update({ style: show ? overlapStyleSources(t) : hiddenSt });
+            } catch (e) {
+                /* ignore */
+            }
+        });
+    }
+
+    function clearOverlapMapLayers() {
+        if (!overlapMap) return;
+        overlapFeaturesBase.concat(overlapFeaturesHits).forEach(function (yf) {
+            try {
+                overlapMap.removeChild(yf);
+            } catch (e) {
+                /* ignore */
+            }
+        });
+        overlapFeaturesBase = [];
+        overlapFeaturesHits = [];
+        overlapLastHitCollection = null;
+        rebuildOverlapHitList([]);
+        var dl = document.getElementById("overlap-download-btn");
+        if (dl) dl.disabled = true;
+        var st = document.getElementById("overlap-status");
+        if (st) st.textContent = "Загрузите KML и нажмите «Найти пересечения»";
+    }
+
+    function fitOverlapMapToBBox(b) {
+        if (!b || !overlapMap || !overlapMap.setLocation) return;
+        try {
+            overlapMap.setLocation({
+                bounds: [
+                    [b.minLng, b.minLat],
+                    [b.maxLng, b.maxLat]
+                ],
+                duration: 280
+            });
+        } catch (e) {
+            /* ignore */
+        }
+    }
+
+    function fitOverlapMapToCurrentLayers() {
+        var mergedB = null;
+        overlapFeaturesBase.concat(overlapFeaturesHits).forEach(function (yf) {
+            var g = yf && yf.geometry;
+            if (!g) return;
+            var bb = bboxFromGeometry(g);
+            if (!bb) return;
+            mergedB = mergedB
+                ? {
+                      minLng: Math.min(mergedB.minLng, bb.minLng),
+                      maxLng: Math.max(mergedB.maxLng, bb.maxLng),
+                      minLat: Math.min(mergedB.minLat, bb.minLat),
+                      maxLat: Math.max(mergedB.maxLat, bb.maxLat)
+                  }
+                : bb;
+        });
+        if (mergedB) fitOverlapMapToBBox(mergedB);
+    }
+
+    async function ensureOverlapMap() {
+        if (overlapMapReady) return;
+        if (typeof ymaps3 === "undefined") {
+            throw new Error("Карта не загружена. Проверьте ключ в config.js.");
+        }
+        await ymaps3.ready;
+        var YMap = ymaps3.YMap;
+        var YMapDefaultSchemeLayer = ymaps3.YMapDefaultSchemeLayer;
+        var YMapDefaultFeaturesLayer = ymaps3.YMapDefaultFeaturesLayer;
+        var el = document.getElementById("overlap-map");
+        if (!el) throw new Error("Нет контейнера карты пересечений.");
+        await waitForNonZeroSize(el);
+        overlapMap = new YMap(
+            el,
+            {
+                location: {
+                    center: [37.618423, 55.751244],
+                    zoom: 5
+                }
+            },
+            [new YMapDefaultSchemeLayer({}), new YMapDefaultFeaturesLayer({})]
+        );
+        overlapMapReady = true;
+    }
+
+    function runOverlapAnalysisFromFile(file, statusEl) {
+        ensureOverlapMap()
+            .then(function () {
+                var fr = new FileReader();
+                fr.onload = function () {
+                    try {
+                        var kml = new DOMParser().parseFromString(fr.result, "text/xml");
+                        var geojson = toGeoJSON.kml(kml);
+                        var rawParts = expandGeoJSONToFeatures(geojson);
+                        var polygonal = rawParts.filter(function (f) {
+                            return f.geometry && isPolygonalGeometry(f.geometry);
+                        });
+                        if (polygonal.length < 2) {
+                            clearOverlapMapLayers();
+                            if (statusEl)
+                                statusEl.textContent = "Нужно минимум два полигона (Polygon / MultiPolygon) в файле.";
+                            toast("В KML меньше двух полигонов для анализа.");
+                            return;
+                        }
+                        if (polygonal.length > 75) {
+                            if (
+                                !confirm(
+                                    "Объектов много (" +
+                                        polygonal.length +
+                                        "). Сравнение всех пар может занять время. Продолжить?"
+                                )
+                            ) {
+                                if (statusEl) statusEl.textContent = "Анализ отменён.";
+                                return;
+                            }
+                        }
+                        clearOverlapMapLayers();
+                        var inputs = [];
+                        for (var idx = 0; idx < polygonal.length; idx++) {
+                            (function (i) {
+                                var feat = polygonal[i];
+                                try {
+                                    var jg = geoJsonGeometryToJsts(feat.geometry);
+                                    if (jg.isEmpty()) return;
+                                    inputs.push({
+                                        feature: feat,
+                                        label: featureLabelForOverlap(feat, i),
+                                        jsts: jg,
+                                        index: i
+                                    });
+                                } catch (e) {
+                                    /* skip bad geom */
+                                }
+                            })(idx);
+                        }
+                        if (inputs.length < 2) {
+                            if (statusEl)
+                                statusEl.textContent = "Не удалось прочитать геометрию полигонов.";
+                            toast("Ошибка геометрии полигонов.");
+                            return;
+                        }
+                        inputs.forEach(function (item) {
+                            var g = item.feature.geometry;
+                            var st = overlapStyleSources(g.type);
+                            var yf = new YMapFeature({
+                                geometry: JSON.parse(JSON.stringify(g)),
+                                style: st
+                            });
+                            overlapMap.addChild(yf);
+                            overlapFeaturesBase.push(yf);
+                        });
+                        refreshOverlapSourceVisibility();
+                        var hitFeaturesGeo = [];
+                        var hitCount = 0;
+                        for (var i = 0; i < inputs.length; i++) {
+                            for (var j = i + 1; j < inputs.length; j++) {
+                                try {
+                                    var inter = inputs[i].jsts.intersection(inputs[j].jsts);
+                                    if (!jstsIntersectionHasPositiveOverlapArea(inter, OVERLAP_MIN_AREA_SQ_DEG))
+                                        continue;
+                                    var polys = polygonGeometriesFromJstsIntersection(inter);
+                                    if (!polys.length) continue;
+                                    polys = polys.filter(function (poly) {
+                                        try {
+                                            var jg = geoJsonGeometryToJsts(poly);
+                                            return (
+                                                jg &&
+                                                typeof jg.getArea === "function" &&
+                                                jg.getArea() > OVERLAP_MIN_AREA_SQ_DEG
+                                            );
+                                        } catch (e2) {
+                                            return false;
+                                        }
+                                    });
+                                    if (!polys.length) continue;
+                                    hitCount++;
+                                    var labelA = inputs[i].label;
+                                    var labelB = inputs[j].label;
+                                    polys.forEach(function (polyGeom, pi) {
+                                        var props = {
+                                            name:
+                                                "Пересечение: " +
+                                                labelA +
+                                                " × " +
+                                                labelB +
+                                                (polys.length > 1 ? " · часть " + (pi + 1) : ""),
+                                            overlapPair: labelA + " | " + labelB
+                                        };
+                                        var gjFeat = {
+                                            type: "Feature",
+                                            properties: props,
+                                            geometry: polyGeom
+                                        };
+                                        hitFeaturesGeo.push(gjFeat);
+                                        var yfHit = new YMapFeature({
+                                            geometry: JSON.parse(JSON.stringify(polyGeom)),
+                                            style: overlapStyleHits("Polygon")
+                                        });
+                                        overlapMap.addChild(yfHit);
+                                        overlapFeaturesHits.push(yfHit);
+                                    });
+                                } catch (e) {
+                                    /* ignore pair */
+                                }
+                            }
+                        }
+                        overlapLastHitCollection = hitFeaturesGeo;
+                        var dlBtn = document.getElementById("overlap-download-btn");
+                        if (dlBtn) dlBtn.disabled = hitFeaturesGeo.length === 0;
+                        var mergedB = null;
+                        polygonal.forEach(function (f) {
+                            var bb = bboxFromGeometry(f.geometry);
+                            if (bb) {
+                                mergedB = mergedB
+                                    ? {
+                                          minLng: Math.min(mergedB.minLng, bb.minLng),
+                                          maxLng: Math.max(mergedB.maxLng, bb.maxLng),
+                                          minLat: Math.min(mergedB.minLat, bb.minLat),
+                                          maxLat: Math.max(mergedB.maxLat, bb.maxLat)
+                                      }
+                                    : bb;
+                            }
+                        });
+                        if (mergedB) fitOverlapMapToBBox(mergedB);
+                        rebuildOverlapHitList(hitFeaturesGeo);
+                        setTimeout(function () {
+                            window.dispatchEvent(new Event("resize"));
+                        }, 60);
+                        var msg =
+                            hitCount === 0
+                                ? "Пересечений с площадью не найдено (пары " +
+                                  inputs.length +
+                                  " полигонов)."
+                                : "Найдено пересечений: " +
+                                  hitCount +
+                                  " пар → " +
+                                  hitFeaturesGeo.length +
+                                  " площадей на карте (красные).";
+                        if (statusEl) statusEl.textContent = msg;
+                        toast(hitCount === 0 ? "Наложений с площадью нет." : "Готово: " + hitCount + " пар.");
+                    } catch (err) {
+                        if (statusEl) statusEl.textContent = "Ошибка разбора KML.";
+                        toast("Ошибка разбора KML.");
+                    }
+                };
+                fr.readAsText(file);
+            })
+            .catch(function (err) {
+                toast(err && err.message ? err.message : "Карта недоступна.");
+            });
+    }
+
+    function setAppMode(mode) {
         var viewEd = document.getElementById("view-editor");
         var viewCo = document.getElementById("view-compare");
+        var viewOv = document.getElementById("view-overlap");
         var tabEd = document.getElementById("mode-tab-editor");
         var tabCo = document.getElementById("mode-tab-compare");
-        if (!viewEd || !viewCo) return;
-        if (compare) {
-            viewEd.hidden = true;
-            viewCo.hidden = false;
-            viewEd.setAttribute("aria-hidden", "true");
-            viewCo.setAttribute("aria-hidden", "false");
-            document.body.classList.add("mode-compare");
-            if (tabEd) {
-                tabEd.classList.remove("is-active");
-                tabEd.setAttribute("aria-selected", "false");
-            }
-            if (tabCo) {
-                tabCo.classList.add("is-active");
-                tabCo.setAttribute("aria-selected", "true");
-            }
-        } else {
-            viewEd.hidden = false;
-            viewCo.hidden = true;
-            viewEd.setAttribute("aria-hidden", "false");
-            viewCo.setAttribute("aria-hidden", "true");
-            document.body.classList.remove("mode-compare");
-            if (tabEd) {
-                tabEd.classList.add("is-active");
-                tabEd.setAttribute("aria-selected", "true");
-            }
-            if (tabCo) {
-                tabCo.classList.remove("is-active");
-                tabCo.setAttribute("aria-selected", "false");
-            }
+        var tabOv = document.getElementById("mode-tab-overlap");
+        if (!viewEd || !viewCo || !viewOv) return;
+        var isEd = mode === "editor";
+        var isCo = mode === "compare";
+        var isOv = mode === "overlap";
+        viewEd.hidden = !isEd;
+        viewCo.hidden = !isCo;
+        viewOv.hidden = !isOv;
+        viewEd.setAttribute("aria-hidden", isEd ? "false" : "true");
+        viewCo.setAttribute("aria-hidden", isCo ? "false" : "true");
+        viewOv.setAttribute("aria-hidden", isOv ? "false" : "true");
+        document.body.classList.toggle("mode-compare", isCo);
+        document.body.classList.toggle("mode-overlap", isOv);
+        if (tabEd) {
+            tabEd.classList.toggle("is-active", isEd);
+            tabEd.setAttribute("aria-selected", isEd ? "true" : "false");
+        }
+        if (tabCo) {
+            tabCo.classList.toggle("is-active", isCo);
+            tabCo.setAttribute("aria-selected", isCo ? "true" : "false");
+        }
+        if (tabOv) {
+            tabOv.classList.toggle("is-active", isOv);
+            tabOv.setAttribute("aria-selected", isOv ? "true" : "false");
         }
         setTimeout(function () {
             window.dispatchEvent(new Event("resize"));
@@ -2310,25 +2783,102 @@
         });
     }
 
+    function wireOverlapControls() {
+        var analyzeBtn = document.getElementById("overlap-analyze-btn");
+        var overlapFile = document.getElementById("overlap-file");
+        var statusEl = document.getElementById("overlap-status");
+        if (analyzeBtn && analyzeBtn.getAttribute("data-bound") !== "1") {
+            analyzeBtn.setAttribute("data-bound", "1");
+            analyzeBtn.addEventListener("click", function () {
+                if (!overlapFile || !overlapFile.files || !overlapFile.files[0]) {
+                    toast("Выберите файл KML.");
+                    return;
+                }
+                runOverlapAnalysisFromFile(overlapFile.files[0], statusEl);
+            });
+        }
+        var fitOvBtn = document.getElementById("overlap-fit-btn");
+        if (fitOvBtn && fitOvBtn.getAttribute("data-bound") !== "1") {
+            fitOvBtn.setAttribute("data-bound", "1");
+            fitOvBtn.addEventListener("click", function () {
+                ensureOverlapMap()
+                    .then(function () {
+                        fitOverlapMapToCurrentLayers();
+                    })
+                    .catch(function (err) {
+                        toast(err && err.message ? err.message : "Карта недоступна.");
+                    });
+            });
+        }
+        var clearOvBtn = document.getElementById("overlap-clear-btn");
+        if (clearOvBtn && clearOvBtn.getAttribute("data-bound") !== "1") {
+            clearOvBtn.setAttribute("data-bound", "1");
+            clearOvBtn.addEventListener("click", function () {
+                clearOverlapMapLayers();
+            });
+        }
+        var dlOvBtn = document.getElementById("overlap-download-btn");
+        if (dlOvBtn && dlOvBtn.getAttribute("data-bound") !== "1") {
+            dlOvBtn.setAttribute("data-bound", "1");
+            dlOvBtn.addEventListener("click", function () {
+                if (!overlapLastHitCollection || overlapLastHitCollection.length === 0) {
+                    toast("Нет пересечений для сохранения.");
+                    return;
+                }
+                downloadKml(
+                    { type: "FeatureCollection", features: overlapLastHitCollection },
+                    "kml-polygon-overlaps.kml"
+                );
+            });
+        }
+        var showSrc = document.getElementById("overlap-show-sources");
+        if (showSrc && showSrc.getAttribute("data-bound") !== "1") {
+            showSrc.setAttribute("data-bound", "1");
+            showSrc.addEventListener("change", refreshOverlapSourceVisibility);
+        }
+        initOverlapHitListOnce();
+    }
+
     function initCompareModeBindings() {
         var tabEd = document.getElementById("mode-tab-editor");
         var tabCo = document.getElementById("mode-tab-compare");
+        var tabOv = document.getElementById("mode-tab-overlap");
         if (tabEd && tabEd.getAttribute("data-mode-bound") !== "1") {
             tabEd.setAttribute("data-mode-bound", "1");
             tabEd.addEventListener("click", function () {
-                setAppMode(false);
+                setAppMode("editor");
             });
         }
         if (tabCo && tabCo.getAttribute("data-mode-bound") !== "1") {
             tabCo.setAttribute("data-mode-bound", "1");
             tabCo.addEventListener("click", function () {
+                setAppMode("compare");
                 ensureCompareMaps()
                     .then(function () {
-                        setAppMode(true);
+                        setTimeout(function () {
+                            window.dispatchEvent(new Event("resize"));
+                        }, 80);
                     })
                     .catch(function (err) {
                         toast(
                             err && err.message ? err.message : "Не удалось открыть режим сравнения."
+                        );
+                    });
+            });
+        }
+        if (tabOv && tabOv.getAttribute("data-mode-bound") !== "1") {
+            tabOv.setAttribute("data-mode-bound", "1");
+            tabOv.addEventListener("click", function () {
+                setAppMode("overlap");
+                ensureOverlapMap()
+                    .then(function () {
+                        setTimeout(function () {
+                            window.dispatchEvent(new Event("resize"));
+                        }, 80);
+                    })
+                    .catch(function (err) {
+                        toast(
+                            err && err.message ? err.message : "Не удалось открыть режим пересечений."
                         );
                     });
             });
@@ -2376,6 +2926,7 @@
                 clearCompareSide("b");
             });
         }
+        wireOverlapControls();
     }
 
     function bindUi() {

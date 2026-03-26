@@ -23,6 +23,7 @@
                     <div class="app-header__modes" role="tablist" aria-label="Режим приложения">
                         <button type="button" class="btn btn--mode is-active" id="mode-tab-editor" role="tab" aria-selected="true" aria-controls="view-editor" data-app-mode="editor">Редактор</button>
                         <button type="button" class="btn btn--mode" id="mode-tab-compare" role="tab" aria-selected="false" aria-controls="view-compare" data-app-mode="compare">Сравнение KML</button>
+                        <button type="button" class="btn btn--mode" id="mode-tab-overlap" role="tab" aria-selected="false" aria-controls="view-overlap" data-app-mode="overlap">Пересечения</button>
                     </div>
                 </div>
                 <p class="selection-badge selection-badge--header" id="selection-info">Выбрано: 0</p>
@@ -132,6 +133,40 @@
                 <div class="compare-splitter" id="compare-splitter" role="separator" aria-orientation="vertical" aria-valuemin="6" aria-valuemax="94" aria-valuenow="50" tabindex="0" title="Перетащите влево-вправо"></div>
                 <div class="compare-legend compare-legend--a">Слева</div>
                 <div class="compare-legend compare-legend--b">Справа</div>
+            </div>
+        </div>
+
+        <div id="view-overlap" class="view-overlap" hidden role="tabpanel" aria-labelledby="mode-tab-overlap" aria-hidden="true">
+            <div class="overlap-toolbar">
+                <span class="overlap-toolbar__title">Поиск наложений в одном KML: только перекрытие площади; общая граница без «внутреннего» пересечения не считается</span>
+                <label class="compare-file-btn btn btn--secondary">
+                    <span>KML файл</span>
+                    <input type="file" id="overlap-file" name="overlap-kml" accept=".kml,application/vnd.google-earth.kml+xml,text/xml" />
+                </label>
+                <button type="button" class="btn btn--primary" id="overlap-analyze-btn">Найти пересечения</button>
+                <button type="button" class="btn btn--secondary" id="overlap-fit-btn">Подогнать вид</button>
+                <button type="button" class="btn btn--ghost" id="overlap-clear-btn">Очистить</button>
+                <button type="button" class="btn btn--ghost" id="overlap-download-btn" disabled title="Сохранить найденные пересечения в KML">Скачать пересечения</button>
+                <label class="overlap-toolbar__check">
+                    <input type="checkbox" id="overlap-show-sources" checked />
+                    <span>Показывать исходные полигоны</span>
+                </label>
+                <p class="overlap-toolbar__status mono" id="overlap-status">Загрузите KML и нажмите «Найти пересечения»</p>
+            </div>
+            <div class="overlap-body">
+                <aside class="overlap-list-pane" aria-label="Список пересечений">
+                    <p class="overlap-list-head">Пересечения</p>
+                    <ul class="overlap-hit-list" id="overlap-hit-list" role="listbox" aria-label="Найденные пересечения"></ul>
+                    <p class="overlap-list-empty mono" id="overlap-list-empty">Список появится после анализа</p>
+                </aside>
+                <div class="overlap-map-wrap">
+                    <div id="overlap-map" class="map overlap-map" role="application" aria-label="Карта пересечений"></div>
+                    <div class="overlap-legend">
+                        <span class="overlap-legend__src">Исходные</span>
+                        <span class="overlap-legend__hit">Пересечение</span>
+                        <span class="overlap-legend__focus">Выбрано в списке</span>
+                    </div>
+                </div>
             </div>
         </div>
         </div>
