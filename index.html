@@ -31,6 +31,7 @@
             <div class="app-header__ops" aria-label="Операции с геометрией">
                 <span class="app-header__ops-label">Операции</span>
                 <div class="app-header__btn-row">
+                    <button type="button" class="btn btn--op btn--header" id="link-polygons-btn" title="Несколько полигонов в один объект (для лимита placemark)">Связать в один</button>
                     <button type="button" class="btn btn--op btn--header" id="union-btn" title="Минимум 2 полигона">Объединить (∪)</button>
                     <button type="button" class="btn btn--op btn--header" id="intersect-btn" title="Ровно 2 полигона">Пересечение (∩)</button>
                     <button type="button" class="btn btn--op btn--header" id="difference-btn" title="Первый минус второй">Вырезать (−)</button>
@@ -39,7 +40,7 @@
                     <button type="button" class="btn btn--danger btn--header" id="delete-object-btn">Удалить выбранное</button>
                 </div>
             </div>
-            <p class="hint hint--compact app-header__hint">∪ ∩ − △ — для полигонов. Линии и точки: импорт, рисование, экспорт.</p>
+            <p class="hint hint--compact app-header__hint">«Связать в один» — один MultiPolygon + опция тонких перемычек (без boolean union). ∪∩−△ — площадные операции. Линии и точки: импорт, рисование, экспорт.</p>
         </header>
 
         <div class="app-main-stage" id="app-main-stage">
@@ -94,6 +95,7 @@
                 <div class="map-draw-toolbar" id="map-draw-toolbar" aria-label="Рисование на карте">
                     <span class="map-draw-toolbar__label">Рисование</span>
                     <button type="button" class="btn btn--ghost btn--draw is-active" data-draw-mode="select" title="Выбор объектов кликом">Выбор</button>
+                    <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="move" title="Перенести выбранный объект целиком за заливку или линию">Перемещение</button>
                     <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="point" title="Одна точка">Точка</button>
                     <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="polyline" title="Линия по кликам, затем Завершить">Линия</button>
                     <button type="button" class="btn btn--ghost btn--draw" data-draw-mode="polygon" title="Полигон по кликам, затем Завершить">Полигон</button>
@@ -102,7 +104,7 @@
                     <button type="button" class="btn btn--ghost btn--draw" id="draw-cancel" hidden>Отмена</button>
                 </div>
                 <div class="map-overlay" id="draw-hint">
-                    <span>Режим «Выбор»: обычный клик по объекту на карте — одно выделение (редактор вершин только у одного полигона/линии). Shift, Ctrl или ⌘ + клик — добавить к выбору (∪∩−, в том числе объекты из разных слоёв). Белые круги — вершины, голубые ромбы — новая вершина на ребре. Рисование — панель сверху.</span>
+                    <span>«Выбор»: ЛКМ по карте двигает карту; Shift + клик — несколько объектов в выборе; перенос целиком удобнее включить кнопкой «Перемещение» на панели. В «Перемещении» тяните выбранный объект за заливку или линию; у вершин — как обычно узел. Ctrl/⌘ + клик — к выбору. Голубые ромбы — новая вершина.</span>
                 </div>
             </main>
         </div>
@@ -186,7 +188,7 @@
     <script src="config.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jsts/1.6.2/jsts.min.js" crossorigin=""></script>
     <script src="https://unpkg.com/togeojson"></script>
-    <script src="https://unpkg.com/tokml/tokml.js"></script>
+    <script src="https://unpkg.com/tokml@0.4.0/tokml.js"></script>
     <script>
         (function () {
             function loadApp() {

@@ -6,6 +6,9 @@
     var map;
     var YMapFeature;
     var YMapListener;
+    /** Пока тащим объект/вершину — отключаем behavior «drag» у карты, иначе двигается карта, а не геометрия. */
+    var mapBehaviorsBeforeDrag = null;
+    var mapDragSuppressCount = 0;
     /** Слой поверх всех объектов: вершины и середины рёбер (иначе applyStackingOrder уводит полигоны выше ручек). */
     var vertexEditLayer = null;
     /** Модификаторы с реального pointer/mousedown (YMapListener часто не отдаёт shiftKey в объекте клика). */
@@ -18,6 +21,8 @@
     var lastMapZoomForVertex = 10;
     /** Активное перетаскивание вершины { entry, desc, idx, handleFeature } */
     var vertexDragState = null;
+    /** Перетаскивание целого объекта: screenAnchor, boundsSnap, mapW/H зафиксированы на время жеста */
+    var featureBodyDragState = null;
     var vertexDragSuppressedClick = false;
     var nextFeatureKey = 1;
     var nextStackKey = 1;
@@ -42,6 +47,12 @@
         rectPreviewPoly: null,
         rectHover: null
     };
+
+    /** Режимы, где карта ставит точки/фигуры; «move» только для переноса, не для рисования. */
+    function isExclusiveDrawMode() {
+        var m = drawState.mode;
+        return m === "point" || m === "polyline" || m === "polygon" || m === "rect";
+    }
 
     function layerById(id) {
         for (var i = 0; i < logicalLayers.length; i++) {
@@ -145,9 +156,7 @@
         if (parsed.num < 0 || parsed.num >= desc.edgeCount) return;
         var mid = vertexEdgeMidpoint(desc, parsed.num);
         desc.insertVertexAfterEdge(parsed.num, mid);
-        if (entry.ymapFeature && entry.ymapFeature.update) {
-            entry.ymapFeature.update({ geometry: entry.feature.geometry });
-        }
+        pushEntryGeometryToYmap(entry);
         vertexDragSuppressedClick = true;
         setTimeout(function () {
             vertexDragSuppressedClick = false;
@@ -164,12 +173,14 @@
         }
         if (geomType === "LineString" || geomType === "MultiLineString") {
             return {
-                stroke: [{ color: strokeHex + (strokeHex.length === 7 ? "ee" : ""), width: strokeW }]
+                stroke: [{ color: strokeHex + (strokeHex.length === 7 ? "ee" : ""), width: strokeW }],
+                interactive: true
             };
         }
         return {
             stroke: [{ color: strokeHex + (strokeHex.length === 7 ? "cc" : ""), width: strokeW }],
-            fill: fillHex
+            fill: fillHex,
+            interactive: true
         };
     }
 
@@ -383,6 +394,13 @@
         return Math.max(degPerPx * 22, 0.000012);
     }
 
+    /** В режиме «Перемещение» узкий порог — иначе вся площадь мелкого полигона считается «у вершины» и тело не тащится. */
+    function getEffectiveVertexHitThresholdDeg() {
+        var t = getVertexHitThresholdDeg();
+        if (drawState.mode === "move") return t * 0.45;
+        return t;
+    }
+
     function preventDomEventDefault(event) {
         if (!event) return;
         var ne = event.nativeEvent || event.originalEvent || event;
@@ -391,13 +409,312 @@
         }
     }
 
+    function suppressMapDragWhileDragging() {
+        if (!map || typeof map.setBehaviors !== "function") return;
+        if (mapDragSuppressCount === 0) {
+            try {
+                mapBehaviorsBeforeDrag =
+                    typeof map.getBehaviors === "function"
+                        ? map.getBehaviors().slice()
+                        : ["drag", "scrollZoom", "pinchZoom", "dblClick"];
+                var noDrag = mapBehaviorsBeforeDrag.filter(function (b) {
+                    return b !== "drag";
+                });
+                map.setBehaviors(noDrag);
+            } catch (e) {
+                mapBehaviorsBeforeDrag = null;
+            }
+        }
+        mapDragSuppressCount++;
+    }
+
+    function releaseMapDragWhileDragging() {
+        if (mapDragSuppressCount <= 0) return;
+        mapDragSuppressCount--;
+        if (mapDragSuppressCount === 0 && mapBehaviorsBeforeDrag && map && typeof map.setBehaviors === "function") {
+            try {
+                map.setBehaviors(mapBehaviorsBeforeDrag);
+            } catch (e2) {
+                /* ignore */
+            }
+            mapBehaviorsBeforeDrag = null;
+        }
+    }
+
+    function resetMapDragSuppression() {
+        if (mapDragSuppressCount <= 0 && !mapBehaviorsBeforeDrag) return;
+        mapDragSuppressCount = 0;
+        if (mapBehaviorsBeforeDrag && map && typeof map.setBehaviors === "function") {
+            try {
+                map.setBehaviors(mapBehaviorsBeforeDrag);
+            } catch (e) {
+                /* ignore */
+            }
+        }
+        mapBehaviorsBeforeDrag = null;
+    }
+
+    function minVertexDistSqFromPoint(entry, lngLat) {
+        var g = entry && entry.feature && entry.feature.geometry;
+        if (!g || !lngLat) return Infinity;
+        var minD = Infinity;
+        function considerRing(ring) {
+            if (!ring || !ring.length) return;
+            var n = ring.length;
+            var limit =
+                ring[0][0] === ring[n - 1][0] && ring[0][1] === ring[n - 1][1] ? n - 1 : n;
+            for (var i = 0; i < limit; i++) {
+                var dLng = ring[i][0] - lngLat[0];
+                var dLat = ring[i][1] - lngLat[1];
+                var d2 = dLng * dLng + dLat * dLat;
+                if (d2 < minD) minD = d2;
+            }
+        }
+        if (g.type === "Point") {
+            var dLng0 = g.coordinates[0] - lngLat[0];
+            var dLat0 = g.coordinates[1] - lngLat[1];
+            return dLng0 * dLng0 + dLat0 * dLat0;
+        }
+        if (g.type === "LineString") {
+            g.coordinates.forEach(function (pt) {
+                var dLng = pt[0] - lngLat[0];
+                var dLat = pt[1] - lngLat[1];
+                var d2 = dLng * dLng + dLat * dLat;
+                if (d2 < minD) minD = d2;
+            });
+            return minD;
+        }
+        if (g.type === "Polygon") {
+            g.coordinates.forEach(considerRing);
+            return minD;
+        }
+        if (g.type === "MultiPolygon") {
+            g.coordinates.forEach(function (poly) {
+                poly.forEach(considerRing);
+            });
+            return minD;
+        }
+        if (g.type === "MultiLineString") {
+            g.coordinates.forEach(function (line) {
+                line.forEach(function (pt) {
+                    var dLng = pt[0] - lngLat[0];
+                    var dLat = pt[1] - lngLat[1];
+                    var d2 = dLng * dLng + dLat * dLat;
+                    if (d2 < minD) minD = d2;
+                });
+            });
+            return minD;
+        }
+        if (g.type === "MultiPoint") {
+            g.coordinates.forEach(function (pt) {
+                var dLng = pt[0] - lngLat[0];
+                var dLat = pt[1] - lngLat[1];
+                var d2 = dLng * dLng + dLat * dLat;
+                if (d2 < minD) minD = d2;
+            });
+            return minD;
+        }
+        return Infinity;
+    }
+
+    /** Попадание в выбранный объект, если под курсором нет entity (заливка иногда не даёт hit). */
+    function lngLatOnSelectedFeature(entry, lngLat) {
+        if (!entry || !lngLat || !entry.feature || !entry.feature.geometry) return false;
+        try {
+            var g = entry.feature.geometry;
+            var t = g.type;
+            var ptFeat = { type: "Point", coordinates: lngLat };
+            var pt = geoJsonGeometryToJsts(ptFeat);
+            var gj = geoJsonGeometryToJsts(g);
+            var tol = getVertexHitThresholdDeg();
+            if (t === "Polygon" || t === "MultiPolygon") {
+                return gj.contains(pt) || gj.intersects(pt);
+            }
+            if (t === "LineString" || t === "MultiLineString") {
+                return typeof gj.distance === "function" && gj.distance(pt) <= tol * 2;
+            }
+            if (t === "Point") {
+                return typeof gj.distance === "function" && gj.distance(pt) < tol * 0.25;
+            }
+            if (t === "MultiPoint") {
+                return typeof gj.distance === "function" && gj.distance(pt) <= tol;
+            }
+        } catch (e) {
+            /* ignore */
+        }
+        return false;
+    }
+
+    function pushEntryGeometryToYmap(entry) {
+        if (!entry || !entry.ymapFeature || !entry.ymapFeature.update) return;
+        try {
+            entry.ymapFeature.update({
+                geometry: JSON.parse(JSON.stringify(entry.feature.geometry))
+            });
+        } catch (e) {
+            /* ignore */
+        }
+    }
+
+    function translateGeometryFromSnapshot(targetGeom, snap, dx, dy) {
+        if (!targetGeom || !snap || targetGeom.type !== snap.type) return;
+        if (snap.type === "GeometryCollection" && snap.geometries) {
+            for (var gi = 0; gi < snap.geometries.length; gi++) {
+                translateGeometryFromSnapshot(targetGeom.geometries[gi], snap.geometries[gi], dx, dy);
+            }
+            return;
+        }
+        if (!snap.coordinates) return;
+        (function walk(tCoords, sCoords) {
+            if (typeof sCoords[0] === "number") {
+                tCoords[0] = sCoords[0] + dx;
+                tCoords[1] = sCoords[1] + dy;
+                return;
+            }
+            for (var i = 0; i < sCoords.length; i++) {
+                walk(tCoords[i], sCoords[i]);
+            }
+        })(targetGeom.coordinates, snap.coordinates);
+    }
+
+    /**
+     * Перенос по событиям YMapListener (как вершины): window pointermove при захвате указателя картой часто не вызывается.
+     * Якорь в пикселях считается от left/top контейнера, зафиксированных на mousedown.
+     */
+    function applyFeatureBodyDragFromMapListenerEvent(listenerEvent) {
+        var s = featureBodyDragState;
+        if (!s || !s.entry || !s.geomSnap || !s.anchorLngLat) return;
+        var bounds = s.boundsSnap || (map && map.bounds);
+        var w = s.mapW;
+        var h = s.mapH;
+        var dx;
+        var dy;
+        var pt = clientPointFromListenerDomEvent(listenerEvent);
+        if (
+            pt != null &&
+            s.screenAnchor != null &&
+            s.rectClientLeft != null &&
+            s.rectClientTop != null &&
+            bounds &&
+            typeof w === "number" &&
+            typeof h === "number" &&
+            w >= 2 &&
+            h >= 2
+        ) {
+            var sx = pt.x - s.rectClientLeft;
+            var sy = pt.y - s.rectClientTop;
+            var cur = lngLatFromMapScreenPxDims(sx, sy, bounds, w, h);
+            var anc = lngLatFromMapScreenPxDims(
+                s.screenAnchor[0],
+                s.screenAnchor[1],
+                bounds,
+                w,
+                h
+            );
+            if (!cur || !anc) {
+                var cFb = lngLatFromDomEvent(listenerEvent);
+                if (!cFb) return;
+                dx = cFb[0] - s.anchorLngLat[0];
+                dy = cFb[1] - s.anchorLngLat[1];
+            } else {
+                dx = cur[0] - anc[0];
+                dy = cur[1] - anc[1];
+            }
+        } else {
+            var c = lngLatFromDomEvent(listenerEvent);
+            if (!c) return;
+            dx = c[0] - s.anchorLngLat[0];
+            dy = c[1] - s.anchorLngLat[1];
+        }
+        if (dx * dx + dy * dy > 4e-18) s.moved = true;
+        translateGeometryFromSnapshot(s.entry.feature.geometry, s.geomSnap, dx, dy);
+        pushEntryGeometryToYmap(s.entry);
+        queueVertexEditorSync();
+    }
+
+    /**
+     * Перенос всего объекта: один выбранный объект, клик по его геометрии не ближе порога к вершине.
+     * Включается в режиме панели «Перемещение» или с зажатым Shift в режиме «Выбор».
+     */
+    function tryStartFeatureBodyDrag(domObject, event) {
+        if (isExclusiveDrawMode()) return;
+        if (vertexDragState) return;
+        if (featureBodyDragState) return;
+        if (!featureBodyDragModifierActive(event)) return;
+        if (selectedOrder.length !== 1) return;
+        var c = lngLatFromDomEvent(event);
+        if (!c) return;
+        var entry = selectedOrder[0];
+        var g = entry.feature.geometry;
+        if (!g) return;
+        var t = g.type;
+        if (
+            t !== "Polygon" &&
+            t !== "LineString" &&
+            t !== "MultiPolygon" &&
+            t !== "MultiLineString" &&
+            t !== "Point" &&
+            t !== "MultiPoint"
+        ) {
+            return;
+        }
+
+        var ent = domObject && domObject.type === "feature" && domObject.entity ? domObject.entity : null;
+        if (ent && isVertexMidHandleEntity(ent)) return;
+        if (ent && isVertexEditHandleEntity(ent)) return;
+        if (ent) {
+            var clicked = (ent.id && idToEntry.get(String(ent.id))) || featureEntityToEntry.get(ent);
+            if (clicked && clicked !== entry) return;
+        } else if (!lngLatOnSelectedFeature(entry, c)) {
+            return;
+        }
+
+        if (t !== "Point" && t !== "MultiPoint") {
+            var thr2b = getEffectiveVertexHitThresholdDeg();
+            thr2b *= thr2b;
+            if (minVertexDistSqFromPoint(entry, c) <= thr2b) return;
+        }
+
+        var ptDn = clientPointFromListenerDomEvent(event);
+        var mapElDn = document.getElementById("map");
+        if (!mapElDn) return;
+
+        suppressMapDragWhileDragging();
+
+        var rectSnap = mapElDn.getBoundingClientRect();
+        var bLive = map && map.bounds;
+        var boundsSnap = copyBoundsCorners(bLive);
+        var screenAnchor = null;
+        var rectClientLeft = null;
+        var rectClientTop = null;
+        if (ptDn) {
+            rectClientLeft = rectSnap.left;
+            rectClientTop = rectSnap.top;
+            screenAnchor = [ptDn.x - rectSnap.left, ptDn.y - rectSnap.top];
+        }
+
+        featureBodyDragState = {
+            entry: entry,
+            screenAnchor: screenAnchor,
+            rectClientLeft: rectClientLeft,
+            rectClientTop: rectClientTop,
+            boundsSnap: boundsSnap,
+            mapW: rectSnap.width,
+            mapH: rectSnap.height,
+            geomSnap: JSON.parse(JSON.stringify(entry.feature.geometry)),
+            moved: false,
+            anchorLngLat: [Number(c[0]), Number(c[1])]
+        };
+        preventDomEventDefault(event);
+    }
+
     /**
      * Перетаскивание: mousedown по выбранному полигону/линии рядом с вершиной (по координатам).
      * Маркеры vtxvis — только визуал (interactive: false): события часто приходят по самой линии/полигону
      * или без object — поэтому ищем ближайшую вершину в радиусе и не начинаем, если клик по другому объекту.
      */
     function tryStartVertexDrag(domObject, event) {
-        if (drawState.mode) return;
+        if (isExclusiveDrawMode()) return;
         if (selectedOrder.length !== 1) return;
         var c = lngLatFromDomEvent(event);
         if (!c) return;
@@ -416,6 +733,7 @@
                     idx: parsed.num,
                     handleFeature: hfDirect
                 };
+                suppressMapDragWhileDragging();
                 preventDomEventDefault(event);
             }
             return;
@@ -424,7 +742,7 @@
             var clicked = (ent.id && idToEntry.get(String(ent.id))) || featureEntityToEntry.get(ent);
             if (clicked && clicked !== entry) return;
         }
-        var thr2 = getVertexHitThresholdDeg();
+        var thr2 = getEffectiveVertexHitThresholdDeg();
         thr2 *= thr2;
         var bestI = -1;
         var bestD = Infinity;
@@ -441,17 +759,24 @@
         if (bestI < 0 || bestD > thr2) return;
         var hf = vertexEditVisualByKey.get(entry.id + ":" + bestI) || null;
         vertexDragState = { entry: entry, desc: desc, idx: bestI, handleFeature: hf };
+        suppressMapDragWhileDragging();
         preventDomEventDefault(event);
     }
 
     function onWindowVertexDragEnd() {
-        if (vertexDragState) {
+        var hadVertex = !!vertexDragState;
+        var hadBody = !!featureBodyDragState;
+        if (hadVertex || (hadBody && featureBodyDragState.moved)) {
             vertexDragSuppressedClick = true;
             setTimeout(function () {
                 vertexDragSuppressedClick = false;
             }, 450);
         }
         vertexDragState = null;
+        featureBodyDragState = null;
+        if (hadVertex || hadBody) {
+            releaseMapDragWhileDragging();
+        }
     }
 
     function applyVertexDragAtLngLat(c) {
@@ -460,9 +785,7 @@
         var desc = vertexDragState.desc;
         var idx = vertexDragState.idx;
         desc.setCoord(idx, c);
-        if (entry.ymapFeature && entry.ymapFeature.update) {
-            entry.ymapFeature.update({ geometry: entry.feature.geometry });
-        }
+        pushEntryGeometryToYmap(entry);
         if (vertexDragState.handleFeature && vertexDragState.handleFeature.update) {
             vertexDragState.handleFeature.update({
                 geometry: { type: "Point", coordinates: [c[0], c[1]] }
@@ -612,7 +935,7 @@
 
     function syncVertexEditor() {
         removeAllVertexEditHandles();
-        if (!map || drawState.mode || typeof YMapFeature !== "function") return;
+        if (!map || isExclusiveDrawMode() || typeof YMapFeature !== "function") return;
         if (selectedOrder.length !== 1) return;
         var entry = selectedOrder[0];
         if (!entry || !idToEntry.get(entry.id)) return;
@@ -867,7 +1190,7 @@
 
     function refreshDrawOverlays() {
         clearDrawOverlays();
-        if (!drawState.mode || !map) return;
+        if (!map || !isExclusiveDrawMode()) return;
         var strokePreview = {
             stroke: [{ color: "#00e5ff", width: 4 }],
             interactive: false,
@@ -928,7 +1251,10 @@
         if (can) can.hidden = !active;
         document.querySelectorAll("[data-draw-mode]").forEach(function (btn) {
             var m = btn.getAttribute("data-draw-mode");
-            btn.classList.toggle("is-active", m === drawState.mode || (m === "select" && !drawState.mode));
+            var on =
+                (m === "select" && !drawState.mode) ||
+                (drawState.mode && m === drawState.mode);
+            btn.classList.toggle("is-active", on);
         });
     }
 
@@ -1044,6 +1370,33 @@
         return null;
     }
 
+    /**
+     * География под точкой экрана в контейнере карты (соответствует видимым bounds).
+     * Нужна для переноса объекта: в движении event.coordinates иногда привязан к полигону, а не к курсору.
+     */
+    /** Линейная проекция px → LngLat для заданных bounds и размера вьюпорта (как при старте перетаскивания). */
+    function lngLatFromMapScreenPxDims(sx, sy, bounds, w, h) {
+        if (!bounds || sx == null || sy == null || w < 2 || h < 2) return null;
+        var c0 = bounds[0];
+        var c1 = bounds[1];
+        if (!c0 || !c1 || c0.length < 2 || c1.length < 2) return null;
+        var minLng = Math.min(c0[0], c1[0]);
+        var maxLng = Math.max(c0[0], c1[0]);
+        var minLat = Math.min(c0[1], c1[1]);
+        var maxLat = Math.max(c0[1], c1[1]);
+        var lng = minLng + (Number(sx) / w) * (maxLng - minLng);
+        var lat = maxLat - (Number(sy) / h) * (maxLat - minLat);
+        return [lng, lat];
+    }
+
+    function copyBoundsCorners(b) {
+        if (!b || !b[0] || !b[1]) return null;
+        return [
+            [Number(b[0][0]), Number(b[0][1])],
+            [Number(b[1][0]), Number(b[1][1])]
+        ];
+    }
+
     /** Список / обычный DOM: Shift / Ctrl / ⌘ */
     function isSelectionModifierKey(nativeEv) {
         return (
@@ -1061,8 +1414,43 @@
             listenerEvent.nativeEvent ||
             listenerEvent.originalEvent ||
             listenerEvent.event;
-        if (e && typeof e.shiftKey === "boolean") return e;
+        if (e) {
+            if (
+                typeof e.shiftKey === "boolean" ||
+                typeof e.clientX === "number" ||
+                typeof e.preventDefault === "function"
+            ) {
+                return e;
+            }
+        }
         if (typeof listenerEvent.shiftKey === "boolean") return listenerEvent;
+        return null;
+    }
+
+    /** clientX/Y из Pointer/Mouse/Touch для синхронизации с getBoundingClientRect карты. */
+    function clientPointFromListenerDomEvent(listenerEvent) {
+        var dom =
+            listenerEvent &&
+            (listenerEvent.domEvent ||
+                listenerEvent.nativeEvent ||
+                listenerEvent.originalEvent ||
+                listenerEvent.event);
+        if (!dom) return null;
+        if (typeof dom.clientX === "number" && typeof dom.clientY === "number") {
+            return { x: dom.clientX, y: dom.clientY };
+        }
+        if (dom.touches && dom.touches.length && dom.touches[0]) {
+            var t = dom.touches[0];
+            if (typeof t.clientX === "number" && typeof t.clientY === "number") {
+                return { x: t.clientX, y: t.clientY };
+            }
+        }
+        if (dom.changedTouches && dom.changedTouches.length && dom.changedTouches[0]) {
+            var ct = dom.changedTouches[0];
+            if (typeof ct.clientX === "number" && typeof ct.clientY === "number") {
+                return { x: ct.clientX, y: ct.clientY };
+            }
+        }
         return null;
     }
 
@@ -1080,9 +1468,17 @@
         mapPointerModifiers.meta = !!ev.metaKey;
     }
 
+    /** Перенос целиком: в режиме «Перемещение» или с зажатым Shift (иначе ЛКМ крутит карту). */
+    function featureBodyDragModifierActive(listenerEvent) {
+        if (drawState.mode === "move") return true;
+        var dom = extractNativeDomEventFromListener(listenerEvent);
+        if (dom && !!dom.shiftKey) return true;
+        return !!mapPointerModifiers.shift;
+    }
+
     function handleMapDomInteraction(domObject, event) {
         var coords = lngLatFromDomEvent(event);
-        if (drawState.mode) {
+        if (isExclusiveDrawMode()) {
             if (!coords) return;
             if (domObject && domObject.entity && isVertexEditHandleEntity(domObject.entity)) return;
             if (domObject && domObject.entity && isVertexMidHandleEntity(domObject.entity)) return;
@@ -1349,7 +1745,7 @@
             map.addChild(e.ymapFeature);
         });
         bringVertexEditLayerToFront();
-        if (drawState.mode) {
+        if (isExclusiveDrawMode()) {
             refreshDrawOverlays();
         } else if (selectedOrder.length === 1) {
             queueVertexEditorSync();
@@ -1757,17 +2153,162 @@
         return allEntries.map(entryToGeoJSON);
     }
 
+    /**
+     * Кольцо: только пары [lng, lat]; иначе tokml падает на cds.join (получает число).
+     */
+    function sanitizeRingCoords(coords, minPoints) {
+        if (!Array.isArray(coords)) return null;
+        var out = [];
+        for (var i = 0; i < coords.length; i++) {
+            var p = coords[i];
+            if (!Array.isArray(p) || p.length < 2) continue;
+            var lng = Number(p[0]);
+            var lat = Number(p[1]);
+            if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
+            out.push([lng, lat]);
+        }
+        if (out.length < minPoints) return null;
+        return out;
+    }
+
+    function sanitizePolygonCoordsAllRings(polyCoords) {
+        if (!Array.isArray(polyCoords) || !polyCoords.length) return null;
+        var ringsOut = [];
+        for (var r = 0; r < polyCoords.length; r++) {
+            var sr = sanitizeRingCoords(polyCoords[r], 4);
+            if (sr) ringsOut.push(sr);
+        }
+        return ringsOut.length ? ringsOut : null;
+    }
+
+    /**
+     * Часть MultiPolygon: либо [внешнее, дыры...], либо ошибочно одно кольцо [[lng,lat],...].
+     */
+    function normalizeMultiPolygonPart(part) {
+        if (!Array.isArray(part) || !part.length) return null;
+        var first = part[0];
+        if (Array.isArray(first) && typeof first[0] === "number") {
+            return sanitizePolygonCoordsAllRings([part]);
+        }
+        if (Array.isArray(first) && Array.isArray(first[0])) {
+            return sanitizePolygonCoordsAllRings(part);
+        }
+        return null;
+    }
+
+    function sanitizeGeometryForTokml(geom) {
+        if (!geom || !geom.type) return null;
+        var t = geom.type;
+        if (t === "Point") {
+            var pc = geom.coordinates;
+            if (!Array.isArray(pc) || pc.length < 2) return null;
+            var lng0 = Number(pc[0]);
+            var lat0 = Number(pc[1]);
+            if (!Number.isFinite(lng0) || !Number.isFinite(lat0)) return null;
+            return { type: "Point", coordinates: [lng0, lat0] };
+        }
+        if (t === "LineString") {
+            var lr = sanitizeRingCoords(geom.coordinates, 2);
+            return lr ? { type: "LineString", coordinates: lr } : null;
+        }
+        if (t === "Polygon") {
+            var pr = sanitizePolygonCoordsAllRings(geom.coordinates || []);
+            return pr ? { type: "Polygon", coordinates: pr } : null;
+        }
+        if (t === "MultiLineString") {
+            var lines = [];
+            (geom.coordinates || []).forEach(function (ln) {
+                var s = sanitizeRingCoords(ln, 2);
+                if (s) lines.push(s);
+            });
+            return lines.length ? { type: "MultiLineString", coordinates: lines } : null;
+        }
+        if (t === "MultiPolygon") {
+            var polys = [];
+            (geom.coordinates || []).forEach(function (part) {
+                var n = normalizeMultiPolygonPart(part);
+                if (n) polys.push(n);
+            });
+            return polys.length ? { type: "MultiPolygon", coordinates: polys } : null;
+        }
+        if (t === "MultiPoint") {
+            var pts = [];
+            (geom.coordinates || []).forEach(function (p) {
+                var g = sanitizeGeometryForTokml({ type: "Point", coordinates: p });
+                if (g) pts.push(g.coordinates);
+            });
+            return pts.length ? { type: "MultiPoint", coordinates: pts } : null;
+        }
+        if (t === "GeometryCollection" && Array.isArray(geom.geometries)) {
+            var gs = [];
+            geom.geometries.forEach(function (g) {
+                var sg = sanitizeGeometryForTokml(g);
+                if (sg) gs.push(sg);
+            });
+            return gs.length ? { type: "GeometryCollection", geometries: gs } : null;
+        }
+        return null;
+    }
+
+    /**
+     * tokml отбрасывает фичи с !properties (в т.ч. null или отсутствует ключ) — тогда KML пустой.
+     * Плюс приводим координаты к виду, который tokml не ломает на linearring.
+     */
+    function normalizeFeatureCollectionForTokml(fc) {
+        if (!fc || fc.type !== "FeatureCollection" || !Array.isArray(fc.features)) {
+            return { type: "FeatureCollection", features: [] };
+        }
+        var features = [];
+        fc.features.forEach(function (f) {
+            var nf = JSON.parse(
+                JSON.stringify(
+                    f || {
+                        type: "Feature",
+                        properties: {},
+                        geometry: null
+                    }
+                )
+            );
+            if (!nf.type) nf.type = "Feature";
+            if (nf.properties == null || typeof nf.properties !== "object") nf.properties = {};
+            var sg = sanitizeGeometryForTokml(nf.geometry);
+            if (!sg) return;
+            nf.geometry = sg;
+            features.push(nf);
+        });
+        return { type: "FeatureCollection", features: features };
+    }
+
     function downloadKml(featureCollection, filename) {
-        var kml = tokml(featureCollection);
-        var blob = new Blob([kml], { type: "application/vnd.google-earth.kml+xml" });
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        var runTokml =
+            typeof tokml === "function"
+                ? tokml
+                : typeof window !== "undefined" && typeof window.tokml === "function"
+                  ? window.tokml
+                  : null;
+        if (!runTokml) {
+            toast("Не удалось экспортировать: скрипт tokml не загрузился (сеть, блокировщик, CDN).");
+            return;
+        }
+        try {
+            var fc = normalizeFeatureCollectionForTokml(featureCollection);
+            if (!fc.features.length) {
+                toast("Нет объектов с корректной геометрией для экспорта (проверьте координаты).");
+                return;
+            }
+            var kml = runTokml(fc);
+            var blob = new Blob([kml], { type: "application/vnd.google-earth.kml+xml" });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement("a");
+            a.href = url;
+            a.download = filename || "export.kml";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            toast("Ошибка при формировании KML: " + (err && err.message ? err.message : String(err)));
+        }
     }
 
     function safeFilename(s) {
@@ -1981,6 +2522,126 @@
         return out;
     }
 
+    /** Центроид по внешнему кольцу (простое среднее), для запасной линии связи. */
+    function centroidOfExteriorRingPolygon(polyGeom) {
+        var ring = polyGeom && polyGeom.coordinates && polyGeom.coordinates[0];
+        if (!ring || ring.length < 3) return null;
+        var n = ring.length - 1;
+        if (ring[0][0] !== ring[n][0] || ring[0][1] !== ring[n][1]) n = ring.length;
+        if (n < 3) return null;
+        var sx = 0;
+        var sy = 0;
+        for (var i = 0; i < n; i++) {
+            sx += Number(ring[i][0]);
+            sy += Number(ring[i][1]);
+        }
+        return [sx / n, sy / n];
+    }
+
+    function jstsNearestLngLatSegmentBetweenPolygonGeoms(polyA, polyB) {
+        try {
+            var j1 = geoJsonGeometryToJsts(polyA);
+            var j2 = geoJsonGeometryToJsts(polyB);
+            var DOp = jsts && jsts.operation && jsts.operation.distance && jsts.operation.distance.DistanceOp;
+            if (typeof DOp !== "function") return null;
+            var op = new DOp(j1, j2);
+            var pts = op.nearestPoints();
+            if (pts && pts.length >= 2 && pts[0] && pts[1]) {
+                return [
+                    [Number(pts[0].x), Number(pts[0].y)],
+                    [Number(pts[1].x), Number(pts[1].y)]
+                ];
+            }
+        } catch (e) {
+            /* ignore */
+        }
+        return null;
+    }
+
+    /** Узкая «лента» между двумя точками на эллипсоиде (~м для ширины). */
+    function thinBridgePolygonRingLngLat(p0, p1, halfWidthMeters) {
+        var hw = Number(halfWidthMeters);
+        if (!Number.isFinite(hw) || hw <= 0) return null;
+        var dLng = p1[0] - p0[0];
+        var dLat = p1[1] - p0[1];
+        var len = Math.sqrt(dLng * dLng + dLat * dLat);
+        if (len < 1e-14) return null;
+        var uLng = dLng / len;
+        var uLat = dLat / len;
+        var midLat = (p0[1] + p1[1]) * 0.5;
+        var rad = (Math.PI / 180) * midLat;
+        var mPerDegLng = 111320 * Math.cos(rad);
+        var mPerDegLat = 111320;
+        if (mPerDegLng < 1) mPerDegLng = 1;
+        var nx = (-uLat * hw) / mPerDegLng;
+        var ny = (uLng * hw) / mPerDegLat;
+        var a = [p0[0] + nx, p0[1] + ny];
+        var b = [p1[0] + nx, p1[1] + ny];
+        var c = [p1[0] - nx, p1[1] - ny];
+        var d = [p0[0] - nx, p0[1] - ny];
+        return [a, b, c, d, a];
+    }
+
+    /**
+     * Собрать выбранные полигоны в одну фичу MultiPolygon (один placemark при экспорте).
+     * Контуры идут в порядке выбора и порядка частей внутри MultiPolygon каждой фичи.
+     * @param {boolean} addBridges — добавить тонкие четырёхугольные перемычки между соседними контурами
+     */
+    function buildLinkMergedPolygonFeature(entries, addBridges, halfWidthMeters) {
+        var polys = [];
+        for (var ei = 0; ei < entries.length; ei++) {
+            var parts = explodeToPolygons(entries[ei].feature.geometry);
+            for (var pi = 0; pi < parts.length; pi++) {
+                polys.push(parts[pi]);
+            }
+        }
+        if (polys.length < 2) return null;
+        var coords = polys.map(function (p) {
+            return p.coordinates;
+        });
+        if (addBridges) {
+            var hw = halfWidthMeters == null ? 2 : Number(halfWidthMeters);
+            if (!Number.isFinite(hw) || hw <= 0) hw = 2;
+            for (var i = 0; i < polys.length - 1; i++) {
+                var seg = jstsNearestLngLatSegmentBetweenPolygonGeoms(polys[i], polys[i + 1]);
+                if (!seg) {
+                    var c1 = centroidOfExteriorRingPolygon(polys[i]);
+                    var c2 = centroidOfExteriorRingPolygon(polys[i + 1]);
+                    if (c1 && c2) seg = [c1, c2];
+                }
+                if (!seg) continue;
+                var ring = thinBridgePolygonRingLngLat(seg[0], seg[1], hw);
+                if (ring) coords.push(ring);
+            }
+        }
+        var props = JSON.parse(JSON.stringify(entries[0].feature.properties || {}));
+        var baseName = props.name != null ? props.name : props.Name;
+        props.name =
+            baseName != null && String(baseName).trim()
+              ? String(baseName).trim() + " (связанный набор)"
+              : "Связанный набор (" + polys.length + " контуров)";
+        props.mergedFromCount = entries.length;
+        props.mergedPolygonParts = polys.length;
+        return {
+            type: "Feature",
+            properties: props,
+            geometry: {
+                type: "MultiPolygon",
+                coordinates: coords
+            }
+        };
+    }
+
+    /** Суммарное число отдельных полигонов у выбранных фич. */
+    function countPolygonPartsInEntries(entries) {
+        var n = 0;
+        for (var i = 0; i < entries.length; i++) {
+            if (!isPolygonalEntry(entries[i])) continue;
+            n += explodeToPolygons(entries[i].feature.geometry).length;
+        }
+        return n;
+    }
+
     function featureLabelForOverlap(feat, index) {
         var p = feat.properties || {};
         var n = p.name;
@@ -2013,6 +2674,9 @@
     }
 
     function clearSelection() {
+        vertexDragState = null;
+        featureBodyDragState = null;
+        resetMapDragSuppression();
         selectedOrder.forEach(function (e) {
             setSelected(e, false);
         });
@@ -3056,6 +3720,92 @@
             toast("Запущена серия загрузок по слоям.");
         });
 
+        var linkPolyBtn = document.getElementById("link-polygons-btn");
+        if (linkPolyBtn) linkPolyBtn.addEventListener("click", function () {
+            var poly = selectedOrder.filter(isPolygonalEntry).slice();
+            var nParts = countPolygonPartsInEntries(poly);
+            if (!poly.length || nParts < 2) {
+                toast(
+                    "Выберите полигоны: всего не меньше двух контуров (несколько объектов и/или один MultiPolygon с несколькими частями)."
+                );
+                return;
+            }
+            var wrap = document.createElement("div");
+            var p = document.createElement("p");
+            p.textContent =
+                "Один объект MultiPolygon из " +
+                nParts +
+                " контур(ов) (" +
+                poly.length +
+                " фич в выборе). Экспорт в KML — один placemark. Текущие выбранные объекты будут удалены (геометрия переносится в новый объект).";
+            var lab = document.createElement("label");
+            lab.className = "field";
+            var chk = document.createElement("input");
+            chk.type = "checkbox";
+            chk.checked = true;
+            chk.id = "modal-link-bridges-" + ++formFieldUid;
+            var sp = document.createElement("span");
+            sp.textContent =
+                " Тонкие перемычки между соседними контурами (порядок: как в списке выбора, затем части внутри каждого объекта)";
+            lab.appendChild(chk);
+            lab.appendChild(sp);
+            var lab2 = document.createElement("label");
+            lab2.className = "field";
+            var lblW = document.createElement("span");
+            lblW.className = "field__label";
+            lblW.textContent = "Полуширина перемычки, м";
+            var inpW = document.createElement("input");
+            inpW.type = "number";
+            inpW.min = "0.5";
+            inpW.max = "30";
+            inpW.step = "0.5";
+            inpW.value = "2";
+            inpW.className = "modal__input";
+            lab2.appendChild(lblW);
+            lab2.appendChild(inpW);
+            wrap.appendChild(p);
+            wrap.appendChild(lab);
+            wrap.appendChild(lab2);
+            openModal("Связать полигоны в один объект", wrap, function () {
+                var feat = buildLinkMergedPolygonFeature(poly, chk.checked, parseFloat(inpW.value, 10));
+                closeModal();
+                if (!feat) {
+                    toast("Не удалось собрать MultiPolygon.");
+                    return;
+                }
+                var undoPayload = poly.map(function (e) {
+                    return {
+                        feature: JSON.parse(JSON.stringify(e.feature)),
+                        logicalLayerId: e.logicalLayerId
+                    };
+                });
+                pickTargetLayerId("Слой для нового объекта", "Заменить выбранные", function (layerId) {
+                    poly.forEach(function (e) {
+                        destroyEntry(e);
+                    });
+                    clearSelection();
+                    var newEntry = createFeatureEntry(feat, layerId);
+                    setSelected(newEntry, true);
+                    selectedOrder.push(newEntry);
+                    updateSelectionBadge();
+                    toast(
+                        "Создан один MultiPolygon вместо " +
+                            undoPayload.length +
+                            " объект(ов). В KML — один placemark.",
+                        "Отменить",
+                        function () {
+                            destroyEntry(newEntry);
+                            undoPayload.forEach(function (u) {
+                                createFeatureEntry(u.feature, u.logicalLayerId);
+                            });
+                            clearSelection();
+                            updateSelectionBadge();
+                        }
+                    );
+                });
+            }, "Продолжить");
+        });
+
         document.getElementById("union-btn").addEventListener("click", function () {
             var poly = selectedOrder.filter(isPolygonalEntry);
             if (poly.length < 2) {
@@ -3255,6 +4005,16 @@
                     exitDraw(true);
                     return;
                 }
+                if (m === "move") {
+                    exitDraw(true);
+                    drawState.mode = "move";
+                    setDrawUI();
+                    toast(
+                        "Режим «Перемещение»: один выбранный объект — тяните за заливку или линию. «Выбор» — обычная работа с картой."
+                    );
+                    queueVertexEditorSync();
+                    return;
+                }
                 startDrawMode(m);
             });
         });
@@ -3328,6 +4088,13 @@
                 true
             );
         }
+        /* Слой карты может быть в shadow DOM — событие не доходит до #map, зато window capture видит shiftKey. */
+        function captureModifiersFromWindow(ev) {
+            captureMapPointerModifiersFromDom(ev);
+        }
+        window.addEventListener("pointerdown", captureModifiersFromWindow, true);
+        window.addEventListener("mousedown", captureModifiersFromWindow, true);
+        window.addEventListener("touchstart", captureModifiersFromWindow, true);
 
         map.addChild(
             new YMapListener({
@@ -3351,16 +4118,20 @@
                 onMouseDown: function (object, event) {
                     captureMapPointerModifiersFromDom(extractNativeDomEventFromListener(event));
                     tryStartVertexDrag(object, event);
+                    if (!vertexDragState) tryStartFeatureBodyDrag(object, event);
                 },
                 onTouchStart: function (object, event) {
                     captureMapPointerModifiersFromDom(extractNativeDomEventFromListener(event));
                     tryStartVertexDrag(object, event);
+                    if (!vertexDragState) tryStartFeatureBodyDrag(object, event);
                 },
                 onMouseMove: function (object, event) {
                     var el = document.getElementById("coords-hint");
                     var c = lngLatFromDomEvent(event);
                     if (vertexDragState && c) {
                         applyVertexDragAtLngLat(c);
+                    } else if (featureBodyDragState) {
+                        applyFeatureBodyDragFromMapListenerEvent(event);
                     }
                     if (el && c) {
                         el.textContent = c[1].toFixed(5) + ", " + c[0].toFixed(5) + " · Яндекс";
@@ -3374,6 +4145,8 @@
                     var c = lngLatFromDomEvent(event);
                     if (vertexDragState && c) {
                         applyVertexDragAtLngLat(c);
+                    } else if (featureBodyDragState) {
+                        applyFeatureBodyDragFromMapListenerEvent(event);
                     }
                 }
             })
